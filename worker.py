@@ -1,36 +1,112 @@
 import os
 import re
 import logging
+import asyncio
+import psycopg2
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from aiogram import Bot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# Load environment configuration variables 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8761162220:AAEsp3UI6Iv5x4y8k4tW9z33LVYFcLEnqlc")
-API_ID = int(os.getenv("API_ID", "35742827"))
-API_HASH = os.getenv("API_HASH", "f2955d75aa8ace7c421a2bb6152c5dd3")
-STRING_SESSION = os.getenv("STRING_SESSION", "1BVtsOKEBuxFkwQaKZ8ScsZu1g3Wdi1xqQqtPxLOoJxfmq8LZFUGP-tpzCX7p2qSlv9KmFvvEOtvUYOOYIlckMYyHhpCR1C_sz1nlLIoC-Tm6gpO90XeB0r7oE68bfBMmIM2eOaj-xixqPuwme-spTcH2OITAUQ9EiLVr881Wzh5mkSEbxHgRUsiXmQdR25vnhJ_p2E5PMqvqCU2gakYyl59ybqNa-4mpqL5YTUBbu_HDZZU4dLFQ_GxsP7V4mos49Y1dq9yV6xYDBIA03wB6KU8d9Pna2Z8yXyzNgfhCZzQ5rHsRF-4thBzSa-83hlYFj4kG8TukxYGbWhFAxCtZ6UhCVS_YXug=")
-ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "8393210427"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=BOT_TOKEN)
-t_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+active_clients = {}
 
-@t_client.on(events.NewMessage(incoming=True))
-async def telethon_incoming_message_handler(event):
-    msg = event.raw_text
-    if "Telegram code" in msg or "is your login code" in msg:
-        m = re.search(r'\b\d{5,6}\b', msg)
+def get_db_connection():
+    """Establishes an isolated bridge line with the Render PostgreSQL engine."""
+    return psycopg2.connect(DATABASE_URL)
+
+async def handle_incoming_otp(phone_number: str, raw_text: str):
+    """Processes intercepted patterns and routes parameters directly to the buyer."""
+    # Fast regex match for standard login patterns
+    if "Telegram code" in raw_text or "is your login code" in raw_text:
+        m = re.search(r'\b\d{5,6}\b', raw_text)
         if m:
             otp = m.group(0)
-            logging.info(f"Captured OTP sequence: {otp}")
-            try:
-                # Delivers straight to your admin profile log window instantly
-                await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=f"🔑 <b>Intercepted Code:</b> <code>{otp}</code>", parse_mode="HTML")
-            except Exception as err:
-                logging.error(f"Failed to forward message payload: {err}")
+            logging.info(f"Successfully caught OTP pattern string: {otp} for number: {phone_number}")
+            
+            # Identify which user bought this phone number and is waiting for the code
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT uid FROM active_orders WHERE phone_number = %s AND status = 'WAITING' LIMIT 1", 
+                        (phone_number,)
+                    )
+                    row = cur.fetchone()
+                    
+                    if row:
+                        buyer_uid = row[0]
+                        # Mark transaction complete to prevent duplicates
+                        cur.execute("UPDATE active_orders SET status = 'DELIVERED' WHERE phone_number = %s", (phone_number,))
+                        conn.commit()
+                        
+                        try:
+                            # Deliver straight to the active consumer chat window instantly
+                            await bot.send_message(
+                                chat_id=buyer_uid,
+                                text=f"🔑 <b>Your Telegram Activation Code Has Arrived!</b>\n\n"
+                                     f"🔢 <b>Number:</b> <code>{phone_number}</code>\n"
+                                     f"⚡ <b>Code:</b> <code>{otp}</code>\n\n"
+                                     f"✨ <i>Thank you for purchasing from SKY OTP BOT!</i>",
+                                parse_mode="HTML"
+                            )
+                            logging.info(f"OTP successfully routed to user ID: {buyer_uid}")
+                        except Exception as d_err:
+                            logging.error(f"Failed direct routing delivery stack call execution: {d_err}")
+
+async def sync_and_start_scraper_pool():
+    """Loops through database inventory rows and monitors active account pipelines simultaneously."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Pull all active string sessions from the database
+                cur.execute("SELECT phone_number, api_id, api_hash, string_session FROM available_accounts")
+                accounts = cur.fetchall()
+    except Exception as db_err:
+        logging.error(f"Failed to fetch sessions from database: {db_err}")
+        return
+
+    for acc in accounts:
+        phone, api_id, api_hash, session_str = acc
+        
+        # If this number is already being monitored in memory, skip it
+        if phone in active_clients:
+            continue
+            
+        logging.info(f"Connecting to database account: {phone}...")
+        try:
+            # Initialize Telethon client using the stored string session
+            client = TelegramClient(StringSession(session_str), int(api_id), api_hash)
+            await client.start()
+            
+            # Set up dynamic event handler attachment pattern strings matching specific reference rows
+            @client.on(events.NewMessage(incoming=True))
+            async def handler(event, p=phone):
+                await handle_incoming_otp(p, event.raw_text)
+                
+            active_clients[phone] = client
+            logging.info(f"Successfully hooked monitoring event thread on pipeline target: {phone}")
+            
+        except Exception as conn_err:
+            logging.error(f"Failed to bootstrap session record configuration row for {phone}: {conn_err}")
+
+async def main():
+    logging.info("Starting isolated Telethon scraper engine...")
+    
+    # Run the initial connection routine for all uploaded accounts
+    await sync_and_start_scraper_pool()
+    
+    # Keep running continuous verification loops active to pick up additions to rows dynamically
+    while True:
+        await asyncio.sleep(30)  # Checks for newly added /addnumber accounts every 30 seconds
+        await sync_and_start_scraper_pool()
 
 if __name__ == "__main__":
-    logging.info("Starting isolated Telethon scraper engine...")
-    t_client.start()
-    t_client.run_until_disconnected()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Scraper background pool offline.")
