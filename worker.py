@@ -1,183 +1,112 @@
 import os
-import asyncio
-import logging
 import re
-from datetime import datetime
-import psycopg
-from telethon import TelegramClient
+import logging
+import asyncio
+import psycopg2
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon import events
+from aiogram import Bot
 
-# --- LOGGING CONFIGURATION ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# --- DATABASE CONNECTION ENGINE ---
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", 
-    "postgresql://sky_otp_db_user:oYom3EdpOfLCpLSGlc2dAV8qY9zw2oot@dpg-d98lkf5aeets73f2po2g-a/sky_otp_db"
-)
+# Load environment configuration variables 
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8761162220:AAEsp3UI6Iv5x4y8k4tW9z33LVYFcLEnqlc")
+DATABASE_URL = os.getenv("postgresql://sky_otp_db_user:oYom3EdpOfLCpLSGlc2dAV8qY9zw2oot@dpg-d98lkf5aeets73f2po2g-a/sky_otp_db")
 
-# Active background runtime memory parameters tracking instances
-running_clients = {}
+bot = Bot(token=BOT_TOKEN)
+active_clients = {}
 
 def get_db_connection():
-    return psycopg.connect(DATABASE_URL)
+    """Establishes an isolated bridge line with the Render PostgreSQL engine."""
+    return psycopg2.connect(DATABASE_URL)
 
-# FIX: Added database schema initialization to worker to completely stop race conditions
-def init_db():
+async def handle_incoming_otp(phone_number: str, raw_text: str):
+    """Processes intercepted patterns and routes parameters directly to the buyer."""
+    # Fast regex match for standard login patterns
+    if "Telegram code" in raw_text or "is your login code" in raw_text:
+        m = re.search(r'\b\d{5,6}\b', raw_text)
+        if m:
+            otp = m.group(0)
+            logging.info(f"Successfully caught OTP pattern string: {otp} for number: {phone_number}")
+            
+            # Identify which user bought this phone number and is waiting for the code
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT uid FROM active_orders WHERE phone_number = %s AND status = 'WAITING' LIMIT 1", 
+                        (phone_number,)
+                    )
+                    row = cur.fetchone()
+                    
+                    if row:
+                        buyer_uid = row[0]
+                        # Mark transaction complete to prevent duplicates
+                        cur.execute("UPDATE active_orders SET status = 'DELIVERED' WHERE phone_number = %s", (phone_number,))
+                        conn.commit()
+                        
+                        try:
+                            # Deliver straight to the active consumer chat window instantly
+                            await bot.send_message(
+                                chat_id=buyer_uid,
+                                text=f"🔑 <b>Your Telegram Activation Code Has Arrived!</b>\n\n"
+                                     f"🔢 <b>Number:</b> <code>{phone_number}</code>\n"
+                                     f"⚡ <b>Code:</b> <code>{otp}</code>\n\n"
+                                     f"✨ <i>Thank you for purchasing from SKY OTP BOT!</i>",
+                                parse_mode="HTML"
+                            )
+                            logging.info(f"OTP successfully routed to user ID: {buyer_uid}")
+                        except Exception as d_err:
+                            logging.error(f"Failed direct routing delivery stack call execution: {d_err}")
+
+async def sync_and_start_scraper_pool():
+    """Loops through database inventory rows and monitors active account pipelines simultaneously."""
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        uid BIGINT PRIMARY KEY, 
-                        balance NUMERIC(10, 2) DEFAULT 0.00, 
-                        join_date TEXT,
-                        screenshot_state BOOLEAN DEFAULT FALSE
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS available_accounts (
-                        id SERIAL PRIMARY KEY,
-                        country_id TEXT,
-                        phone_number TEXT UNIQUE,
-                        api_id TEXT,
-                        api_hash TEXT,
-                        string_session TEXT,
-                        is_sold BOOLEAN DEFAULT FALSE
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS active_orders (
-                        uid BIGINT,
-                        account_id INTEGER,
-                        phone_number TEXT,
-                        country_name TEXT,
-                        cost_inr NUMERIC(10, 2),
-                        status TEXT DEFAULT 'WAITING',
-                        timestamp TEXT
-                    )
-                """)
-                conn.commit()
-                logging.info("⚡ Background worker verified and initialized database schemas successfully.")
-    except Exception as e:
-        logging.error(f"Database sync fault exception in worker: {e}")
+                # Pull all active string sessions from the database
+                cur.execute("SELECT phone_number, api_id, api_hash, string_session FROM available_accounts")
+                accounts = cur.fetchall()
+    except Exception as db_err:
+        logging.error(f"Failed to fetch sessions from database: {db_err}")
+        return
 
-# --- OTP EXTRACTOR LOGIC ---
-def extract_otp(message_text: str) -> str:
-    if not message_text:
-        return ""
-    match = re.search(r'\b\d{4,6}\b', message_text)
-    return match.group(0) if match else ""
-
-# --- TELEGRAM INBOUND EVENT RECEPTOR ---
-async def register_telegram_listeners(account_id, phone, client: TelegramClient):
-    @client.on(events.NewMessage(incoming=True))
-    async def incoming_sms_handler(event):
-        sender = await event.get_sender()
-        sender_name = getattr(sender, 'title', getattr(sender, 'username', 'Unknown System Source'))
-        msg_text = event.raw_text
+    for acc in accounts:
+        phone, api_id, api_hash, session_str = acc
         
-        logging.info(f"📩 Inbound payload captured on [{phone}] from {sender_name}: {msg_text}")
-        
-        otp_code = extract_otp(msg_text)
-        if otp_code:
-            logging.info(f"✨ OTP Extracted successfully: {otp_code}. Syncing payload data...")
+        # If this number is already being monitored in memory, skip it
+        if phone in active_clients:
+            continue
             
-            try:
-                with get_db_connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            UPDATE active_orders 
-                            SET status = 'COMPLETED' 
-                            WHERE account_id = %s AND status = 'WAITING'
-                        """, (account_id,))
-                        
-                        cur.execute("""
-                            UPDATE available_accounts 
-                            SET is_sold = TRUE 
-                            WHERE id = %s
-                        """, (account_id,))
-                        
-                        cur.execute("""
-                            UPDATE users 
-                            SET balance = balance - (
-                                SELECT cost_inr FROM active_orders WHERE account_id = %s LIMIT 1
-                            )
-                            WHERE uid = (
-                                SELECT uid FROM active_orders WHERE account_id = %s LIMIT 1
-                            )
-                        """, (account_id, account_id))
-                        
-                        conn.commit()
-                
-                logging.info(f"✅ Database transaction logs locked for {phone}. Shutting down worker runtime connection.")
-                await client.disconnect()
-                running_clients.pop(account_id, None)
-                
-            except Exception as ex:
-                logging.error(f"Failed to synchronize state update operations into cluster: {ex}")
-
-# --- PROCESSING LOOP ROUTINE ---
-async def check_active_orders_pipeline():
-    while True:
+        logging.info(f"Connecting to database account: {phone}...")
         try:
-            with get_db_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT ao.account_id, ao.phone_number, aa.api_id, aa.api_hash, aa.string_session 
-                        FROM active_orders ao
-                        JOIN available_accounts aa ON ao.account_id = aa.id
-                        WHERE ao.status = 'WAITING'
-                    """)
-                    pending_orders = cur.fetchall()
-                    
-            for order in pending_orders:
-                acc_id, phone, api_id, api_hash, session_str = order
-                
-                if not session_str or str(session_str).strip() == "" or session_str == "None":
-                    logging.warning(f"⚠️ Account ID {acc_id} ({phone}) contains an empty/corrupted session token string parameter. Skipping execution flow entirely.")
-                    continue
-                
-                if acc_id in running_clients:
-                    continue
-                
-                logging.info(f"⚡ Spawning independent Telethon runtime client pipeline context for: {phone}")
-                
-                try:
-                    client = TelegramClient(
-                        StringSession(str(session_str).strip()), 
-                        int(api_id), 
-                        str(api_hash)
-                    )
-                    
-                    await client.connect()
-                    
-                    if not await client.is_user_authorized():
-                        logging.error(f"❌ Session string credentials rejected by server infrastructure for phone mapping index: {phone}")
-                        await client.disconnect()
-                        continue
-                        
-                    running_clients[acc_id] = client
-                    asyncio.create_task(register_telegram_listeners(acc_id, phone, client))
-                    
-                except Exception as client_err:
-                    logging.error(f"Failed to initiate background connectivity channels for user entry {phone}: {client_err}")
-                    
-        except Exception as main_err:
-            logging.error(f"Poller system loop met database backend connection errors: {main_err}")
+            # Initialize Telethon client using the stored string session
+            client = TelegramClient(StringSession(session_str), int(api_id), api_hash)
+            await client.start()
             
-        await asyncio.sleep(8)
+            # Set up dynamic event handler attachment pattern strings matching specific reference rows
+            @client.on(events.NewMessage(incoming=True))
+            async def handler(event, p=phone):
+                await handle_incoming_otp(p, event.raw_text)
+                
+            active_clients[phone] = client
+            logging.info(f"Successfully hooked monitoring event thread on pipeline target: {phone}")
+            
+        except Exception as conn_err:
+            logging.error(f"Failed to bootstrap session record configuration row for {phone}: {conn_err}")
 
-# --- SYSTEM PROCESS ENTRY POINT ---
 async def main():
-    # FIX: Run table generation immediately at startup before looping begins
-    init_db()
-    logging.info("🚀 Sky Cloud Automation Worker Loop Initialized successfully. Watching deployment channels...")
-    await check_active_orders_pipeline()
+    logging.info("Starting isolated Telethon scraper engine...")
+    
+    # Run the initial connection routine for all uploaded accounts
+    await sync_and_start_scraper_pool()
+    
+    # Keep running continuous verification loops active to pick up additions to rows dynamically
+    while True:
+        await asyncio.sleep(30)  # Checks for newly added /addnumber accounts every 30 seconds
+        await sync_and_start_scraper_pool()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("👋 Background worker process stopped safely.")
+        logging.info("Scraper background pool offline.")
