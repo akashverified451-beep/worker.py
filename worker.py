@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import re
 from datetime import datetime
 import psycopg
 from telethon import TelegramClient
@@ -22,23 +23,55 @@ running_clients = {}
 def get_db_connection():
     return psycopg.connect(DATABASE_URL)
 
+# FIX: Added database schema initialization to worker to completely stop race conditions
+def init_db():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        uid BIGINT PRIMARY KEY, 
+                        balance NUMERIC(10, 2) DEFAULT 0.00, 
+                        join_date TEXT,
+                        screenshot_state BOOLEAN DEFAULT FALSE
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS available_accounts (
+                        id SERIAL PRIMARY KEY,
+                        country_id TEXT,
+                        phone_number TEXT UNIQUE,
+                        api_id TEXT,
+                        api_hash TEXT,
+                        string_session TEXT,
+                        is_sold BOOLEAN DEFAULT FALSE
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS active_orders (
+                        uid BIGINT,
+                        account_id INTEGER,
+                        phone_number TEXT,
+                        country_name TEXT,
+                        cost_inr NUMERIC(10, 2),
+                        status TEXT DEFAULT 'WAITING',
+                        timestamp TEXT
+                    )
+                """)
+                conn.commit()
+                logging.info("⚡ Background worker verified and initialized database schemas successfully.")
+    except Exception as e:
+        logging.error(f"Database sync fault exception in worker: {e}")
+
 # --- OTP EXTRACTOR LOGIC ---
 def extract_otp(message_text: str) -> str:
-    """
-    Utility script parsing module to capture numerical sequence verification thresholds.
-    """
     if not message_text:
         return ""
-    import re
-    # Matches common 4, 5, or 6 digit codes typically transmitted by Telegram
     match = re.search(r'\b\d{4,6}\b', message_text)
     return match.group(0) if match else ""
 
 # --- TELEGRAM INBOUND EVENT RECEPTOR ---
 async def register_telegram_listeners(account_id, phone, client: TelegramClient):
-    """
-    Listens for live incoming messages on active tracking channels.
-    """
     @client.on(events.NewMessage(incoming=True))
     async def incoming_sms_handler(event):
         sender = await event.get_sender()
@@ -54,21 +87,18 @@ async def register_telegram_listeners(account_id, phone, client: TelegramClient)
             try:
                 with get_db_connection() as conn:
                     with conn.cursor() as cur:
-                        # 1. Update active transaction pipeline state metrics
                         cur.execute("""
                             UPDATE active_orders 
                             SET status = 'COMPLETED' 
                             WHERE account_id = %s AND status = 'WAITING'
                         """, (account_id,))
                         
-                        # 2. Mark specific structural phone catalog file index as sold
                         cur.execute("""
                             UPDATE available_accounts 
                             SET is_sold = TRUE 
                             WHERE id = %s
                         """, (account_id,))
                         
-                        # 3. Securely deduct balance allocation requirements from customer wallet profile
                         cur.execute("""
                             UPDATE users 
                             SET balance = balance - (
@@ -82,8 +112,6 @@ async def register_telegram_listeners(account_id, phone, client: TelegramClient)
                         conn.commit()
                 
                 logging.info(f"✅ Database transaction logs locked for {phone}. Shutting down worker runtime connection.")
-                
-                # Gracefully terminate network loop channels after successful validation receipt 
                 await client.disconnect()
                 running_clients.pop(account_id, None)
                 
@@ -92,14 +120,10 @@ async def register_telegram_listeners(account_id, phone, client: TelegramClient)
 
 # --- PROCESSING LOOP ROUTINE ---
 async def check_active_orders_pipeline():
-    """
-    Scans internal tables for pending transactions, handling validation steps cleanly.
-    """
     while True:
         try:
             with get_db_connection() as conn:
                 with conn.cursor() as cur:
-                    # Scan for new processing requests matching existing parameters safely
                     cur.execute("""
                         SELECT ao.account_id, ao.phone_number, aa.api_id, aa.api_hash, aa.string_session 
                         FROM active_orders ao
@@ -111,18 +135,16 @@ async def check_active_orders_pipeline():
             for order in pending_orders:
                 acc_id, phone, api_id, api_hash, session_str = order
                 
-                # CRITICAL DEFENSIVE FIX: Skip structural entries with empty strings or NoneType instances
                 if not session_str or str(session_str).strip() == "" or session_str == "None":
                     logging.warning(f"⚠️ Account ID {acc_id} ({phone}) contains an empty/corrupted session token string parameter. Skipping execution flow entirely.")
                     continue
                 
                 if acc_id in running_clients:
-                    continue # Thread engine validation instance is already active
+                    continue
                 
                 logging.info(f"⚡ Spawning independent Telethon runtime client pipeline context for: {phone}")
                 
                 try:
-                    # Initializing dynamic telethon storage buffers directly from clean, non-null properties
                     client = TelegramClient(
                         StringSession(str(session_str).strip()), 
                         int(api_id), 
@@ -137,8 +159,6 @@ async def check_active_orders_pipeline():
                         continue
                         
                     running_clients[acc_id] = client
-                    
-                    # Spawn active validation listening hooks immediately
                     asyncio.create_task(register_telegram_listeners(acc_id, phone, client))
                     
                 except Exception as client_err:
@@ -147,11 +167,12 @@ async def check_active_orders_pipeline():
         except Exception as main_err:
             logging.error(f"Poller system loop met database backend connection errors: {main_err}")
             
-        # Standard loop poll interval delay configuration
         await asyncio.sleep(8)
 
 # --- SYSTEM PROCESS ENTRY POINT ---
 async def main():
+    # FIX: Run table generation immediately at startup before looping begins
+    init_db()
     logging.info("🚀 Sky Cloud Automation Worker Loop Initialized successfully. Watching deployment channels...")
     await check_active_orders_pipeline()
 
