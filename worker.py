@@ -2,7 +2,7 @@ import os
 import re
 import logging
 import asyncio
-import psycopg2
+import psycopg # FIXED: Swapped from psycopg2 to psycopg
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from aiogram import Bot
@@ -11,14 +11,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # Load environment configuration variables 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8761162220:AAEsp3UI6Iv5x4y8k4tW9z33LVYFcLEnqlc")
-DATABASE_URL = os.getenv("postgresql://sky_otp_db_user:oYom3EdpOfLCpLSGlc2dAV8qY9zw2oot@dpg-d98lkf5aeets73f2po2g-a/sky_otp_db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=BOT_TOKEN)
 active_clients = {}
 
 def get_db_connection():
     """Establishes an isolated bridge line with the Render PostgreSQL engine."""
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg.connect(DATABASE_URL) # FIXED: Using new psycopg connection wrapper
 
 async def handle_incoming_otp(phone_number: str, raw_text: str):
     """Processes intercepted patterns and routes parameters directly to the buyer."""
@@ -30,33 +30,36 @@ async def handle_incoming_otp(phone_number: str, raw_text: str):
             logging.info(f"Successfully caught OTP pattern string: {otp} for number: {phone_number}")
             
             # Identify which user bought this phone number and is waiting for the code
-            with get_db_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT uid FROM active_orders WHERE phone_number = %s AND status = 'WAITING' LIMIT 1", 
-                        (phone_number,)
-                    )
-                    row = cur.fetchone()
-                    
-                    if row:
-                        buyer_uid = row[0]
-                        # Mark transaction complete to prevent duplicates
-                        cur.execute("UPDATE active_orders SET status = 'DELIVERED' WHERE phone_number = %s", (phone_number,))
-                        conn.commit()
+            try:
+                with get_db_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT uid FROM active_orders WHERE phone_number = %s AND status = 'WAITING' LIMIT 1", 
+                            (phone_number,)
+                        )
+                        row = cur.fetchone()
                         
-                        try:
-                            # Deliver straight to the active consumer chat window instantly
-                            await bot.send_message(
-                                chat_id=buyer_uid,
-                                text=f"🔑 <b>Your Telegram Activation Code Has Arrived!</b>\n\n"
-                                     f"🔢 <b>Number:</b> <code>{phone_number}</code>\n"
-                                     f"⚡ <b>Code:</b> <code>{otp}</code>\n\n"
-                                     f"✨ <i>Thank you for purchasing from SKY OTP BOT!</i>",
-                                parse_mode="HTML"
-                            )
-                            logging.info(f"OTP successfully routed to user ID: {buyer_uid}")
-                        except Exception as d_err:
-                            logging.error(f"Failed direct routing delivery stack call execution: {d_err}")
+                        if row:
+                            buyer_uid = row[0]
+                            # Mark transaction complete to prevent duplicates
+                            cur.execute("UPDATE active_orders SET status = 'DELIVERED' WHERE phone_number = %s", (phone_number,))
+                            conn.commit()
+                            
+                            try:
+                                # Deliver straight to the active consumer chat window instantly
+                                await bot.send_message(
+                                    chat_id=buyer_uid,
+                                    text=f"🔑 <b>Your Telegram Activation Code Has Arrived!</b>\n\n"
+                                         f"🔢 <b>Number:</b> <code>{phone_number}</code>\n"
+                                         f"⚡ <b>Code:</b> <code>{otp}</code>\n\n"
+                                         f"✨ <i>Thank you for purchasing from SKY OTP BOT!</i>",
+                                    parse_mode="HTML"
+                                )
+                                logging.info(f"OTP successfully routed to user ID: {buyer_uid}")
+                            except Exception as d_err:
+                                logging.error(f"Failed direct routing delivery stack call execution: {d_err}")
+            except Exception as sql_err:
+                logging.error(f"Database query operation error inside OTP handler: {sql_err}")
 
 async def sync_and_start_scraper_pool():
     """Loops through database inventory rows and monitors active account pipelines simultaneously."""
