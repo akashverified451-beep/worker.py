@@ -2,7 +2,7 @@ import os
 import re
 import logging
 import asyncio
-import psycopg2
+import psycopg
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from aiogram import Bot
@@ -18,7 +18,7 @@ active_clients = {}
 
 def get_db_connection():
     """Establishes an isolated bridge line with the Render PostgreSQL engine."""
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg.connect(DATABASE_URL)
 
 async def handle_incoming_otp(phone_number: str, raw_text: str):
     """Processes intercepted patterns and routes parameters directly to the buyer."""
